@@ -1,7 +1,3 @@
-import * as wasm from "../build/release.js";
-import RBush from "rbush";
-import knn from "rbush-knn";
-
 export type LatLng = {
 	lat: number;
 	lng: number;
@@ -28,6 +24,12 @@ function project(latlng: LatLng): Point {
 		x: R * latlng.lng / d,
 		y: R * Math.log((1 + sin) / (1 - sin)) / 2
 	};
+}
+
+function project2(latlng: LatLng, output: number[], outputOffset: number): void {
+	const sin = Math.sin(latlng.lat / d);
+	output[outputOffset] = R * latlng.lng / d;
+	output[outputOffset + 1] = R * Math.log((1 + sin) / (1 - sin)) / 2;
 }
 
 /**
@@ -75,242 +77,11 @@ function pointDistance(point1: Point, point2: Point, sq = false): number {
 	return sq ? squareResult : Math.sqrt(squareResult);
 }
 
-const wasmCleanupRegistry = new FinalizationRegistry((ptr: number) => {
-	wasm.__unpin(ptr);
-});
-
 type Idx<T extends LatLng[] | LatLng[][]> = T extends LatLng[][] ? [number, number] : number;
 
-export class WasmPolyline<T extends LatLng[] | LatLng[][]> {
-
-	readonly trackPointsPtr: number;
-	readonly trackPointsView: Float64Array;
-
-	readonly sectionOffsetsPtr: number;
-	readonly sectionOffsetsView: Int32Array;
-
-	readonly flat: boolean;
-
-	constructor(trackPoints: T, isPolygon = false) {
-		this.flat = isFlat(trackPoints);
-		const normalizedTrackPoints = (this.flat ? [trackPoints] : trackPoints) as LatLng[][];
-
-		if (!normalizedTrackPoints.some((t) => t.length >= 2)) {
-			throw new Error("Line doesn't have any track points.");
-		}
-
-		const trackPointsLength = 2 * normalizedTrackPoints.reduce((p, c) => p + c.length + (isPolygon ? 1 : 0), 0);
-		this.trackPointsPtr = wasm.createF64Array(trackPointsLength);
-		wasm.__pin(this.trackPointsPtr);
-		wasmCleanupRegistry.register(this, this.trackPointsPtr);
-
-		this.trackPointsView = new Float64Array(wasm.memory.buffer, this.trackPointsPtr, trackPointsLength);
-		let i = 0;
-		for (const points of normalizedTrackPoints) {
-			for (const p of points) {
-				const projected = project(p);
-				this.trackPointsView[i++] = projected.x;
-				this.trackPointsView[i++] = projected.y;
-			}
-
-			if (isPolygon && points.length > 0) {
-				const projected = project(points[0]);
-				this.trackPointsView[i++] = projected.x;
-				this.trackPointsView[i++] = projected.y;
-			}
-		}
-
-		const sectionOffsetsLength = Math.max(0, normalizedTrackPoints.length - 1);
-		this.sectionOffsetsPtr = wasm.createI32Array(sectionOffsetsLength);
-		wasm.__pin(this.sectionOffsetsPtr);
-		wasmCleanupRegistry.register(this, this.sectionOffsetsPtr);
-
-		this.sectionOffsetsView = new Int32Array(wasm.memory.buffer, this.sectionOffsetsPtr, sectionOffsetsLength);
-		for (let offset = 0, i = 0; i < normalizedTrackPoints.length; i++) {
-			if (i > 0) {
-				this.sectionOffsetsView[i - 1] = offset;
-			}
-			offset += normalizedTrackPoints[i].length;
-		}
-	}
-
-	/**
-	 * Finds the closest position to the given point(s) on the given polyline.
-	 * The position is given in the form of a fractional index. The index is a float somewhere between the integer index of point A
-	 * of the matching segment and the integer index of point B of the matching segment.
-	 * @param trackPoints The track points of the line. If this is an array of arrays, it is treated as a MultiLineString/Multipolygon.
-	 * @param points The point or points to locate on the line.
-	 * @param isPolygon If true, the line will be treated as a polygon, meaning that there is an additional segment between the last
-	 *     and the first trackpoint (which can result in an index somewhere between trackPoints.length - 1 and trackPoints.length).
-	 * @returns If points is an array of points, returns an array matching its length and order. Otherwise a single object is returned.
-	 *     If trackPoints is an array of lines, the resulting index will be a tuple where the first number is the index of the line
-	 *     and the second number is the fractional index on that line. Otherwise, the fractional index is returned as a number.
-	 */
-	locateOnLine(point: LatLng): { idx: Idx<T>; closest: LatLng };
-	locateOnLine(points: LatLng[]): Array<{ idx: Idx<T>; closest: LatLng }>;
-	locateOnLine(points: LatLng | LatLng[]): { idx: Idx<T>; closest: LatLng } | Array<{ idx: Idx<T>; closest: LatLng }> {
-		const normalizedPoints = Array.isArray(points) ? points : [points];
-
-		const rawResult = wasm.locateOnLine(this.trackPointsPtr, this.sectionOffsetsPtr, normalizedPoints.flatMap((p) => [p.lat, p.lng]));
-
-		const result = new Array<{ idx: Idx<T>; closest: LatLng }>(rawResult.length / 4);
-		for (let i = 0, j = 0; i < rawResult.length; i += 4, j++) {
-			result[j] = {
-				idx: (this.flat ? rawResult[i + 1] : [rawResult[i], rawResult[i + 1]]) as Idx<T>,
-				closest: { lat: rawResult[i + 2], lng: rawResult[i + 3] }
-			};
-		}
-
-		return Array.isArray(points) ? result : result[0];
-	}
-}
+const boxSize = 500;
 
 export class JsPolyline1<T extends LatLng[] | LatLng[][]> {
-
-	readonly trackPoints: Point[][];
-	readonly flat: boolean;
-
-	constructor(trackPoints: T, isPolygon = false) {
-		this.flat = isFlat(trackPoints);
-		const normalizedTrackPoints = (this.flat ? [trackPoints] : trackPoints) as LatLng[][];
-
-		if (!normalizedTrackPoints.some((t) => t.length >= 2)) {
-			throw new Error("Line doesn't have any track points.");
-		}
-
-		this.trackPoints = normalizedTrackPoints.map((t) => t.map((p) => project(p)));
-	}
-
-	/**
-	 * Finds the closest position to the given point(s) on the given polyline.
-	 * The position is given in the form of a fractional index. The index is a float somewhere between the integer index of point A
-	 * of the matching segment and the integer index of point B of the matching segment.
-	 * @param trackPoints The track points of the line. If this is an array of arrays, it is treated as a MultiLineString/Multipolygon.
-	 * @param points The point or points to locate on the line.
-	 * @param isPolygon If true, the line will be treated as a polygon, meaning that there is an additional segment between the last
-	 *     and the first trackpoint (which can result in an index somewhere between trackPoints.length - 1 and trackPoints.length).
-	 * @returns If points is an array of points, returns an array matching its length and order. Otherwise a single object is returned.
-	 *     If trackPoints is an array of lines, the resulting index will be a tuple where the first number is the index of the line
-	 *     and the second number is the fractional index on that line. Otherwise, the fractional index is returned as a number.
-	 */
-	locateOnLine(point: LatLng): { idx: Idx<T>; closest: LatLng };
-	locateOnLine(points: LatLng[]): Array<{ idx: Idx<T>; closest: LatLng }>;
-	locateOnLine(points: LatLng | LatLng[]): { idx: Idx<T>; closest: LatLng } | Array<{ idx: Idx<T>; closest: LatLng }> {
-		const projectedPoints = (Array.isArray(points) ? points : [points]).map((point) => project(point));
-
-		const data: Array<{ sqDist: number; idx: [number, number]; closest: Point }> = [];
-
-		for (let i = 0; i < this.trackPoints.length; i++) {
-			let pointA: Point;
-			let pointB = this.trackPoints[i][0];
-			for (let j = 1; j < this.trackPoints[i].length; j++) {
-				pointA = pointB;
-				pointB = this.trackPoints[i][j];
-
-				for (let k = 0; k < projectedPoints.length; k++) {
-					const point = projectedPoints[k];
-					const closest = closestPointOnSegment(point, pointA, pointB);
-					const sqDist = pointDistance(point, closest, true);
-					if (data[k] == null || sqDist < data[k].sqDist) {
-						data[k] = { sqDist, idx: [i, j - 1 + closest.t], closest };
-					}
-				}
-			}
-		}
-
-		const results = data.map((d) => {
-			return {
-				idx: (this.flat ? d.idx[1] : d.idx) as Idx<T>,
-				closest: unproject(d.closest)
-			};
-		});
-
-		return Array.isArray(points) ? results : results[0];
-	}
-}
-
-export class JsPolyline2<T extends LatLng[] | LatLng[][]> {
-
-	readonly trackPoints: Float64Array;
-	readonly sectionOffsets: number[];
-	readonly flat: boolean;
-
-	constructor(trackPoints: T, isPolygon = false) {
-		this.flat = isFlat(trackPoints);
-		const normalizedTrackPoints = (this.flat ? [trackPoints] : trackPoints) as LatLng[][];
-
-		if (!normalizedTrackPoints.some((t) => t.length >= 2)) {
-			throw new Error("Line doesn't have any track points.");
-		}
-
-		const trackPointsLength = 2 * normalizedTrackPoints.reduce((p, c) => p + c.length + (isPolygon ? 1 : 0), 0);
-		this.trackPoints = new Float64Array(trackPointsLength);
-		let i = 0;
-		for (const points of normalizedTrackPoints) {
-			for (const p of points) {
-				this.trackPoints[i++] = p.lat;
-				this.trackPoints[i++] = p.lng;
-			}
-
-			if (isPolygon && points.length > 0) {
-				this.trackPoints[i++] = points[0].lat;
-				this.trackPoints[i++] = points[0].lng;
-			}
-		}
-
-		this.sectionOffsets = normalizedTrackPoints.slice(1).map((t) => t.length);
-	}
-
-	/**
-	 * Finds the closest position to the given point(s) on the given polyline.
-	 * The position is given in the form of a fractional index. The index is a float somewhere between the integer index of point A
-	 * of the matching segment and the integer index of point B of the matching segment.
-	 * @param trackPoints The track points of the line. If this is an array of arrays, it is treated as a MultiLineString/Multipolygon.
-	 * @param points The point or points to locate on the line.
-	 * @param isPolygon If true, the line will be treated as a polygon, meaning that there is an additional segment between the last
-	 *     and the first trackpoint (which can result in an index somewhere between trackPoints.length - 1 and trackPoints.length).
-	 * @returns If points is an array of points, returns an array matching its length and order. Otherwise a single object is returned.
-	 *     If trackPoints is an array of lines, the resulting index will be a tuple where the first number is the index of the line
-	 *     and the second number is the fractional index on that line. Otherwise, the fractional index is returned as a number.
-	 */
-	locateOnLine(point: LatLng): { idx: Idx<T>; closest: LatLng };
-	locateOnLine(points: LatLng[]): Array<{ idx: Idx<T>; closest: LatLng }>;
-	locateOnLine(points: LatLng | LatLng[]): { idx: Idx<T>; closest: LatLng } | Array<{ idx: Idx<T>; closest: LatLng }> {
-		const projectedPoints = (Array.isArray(points) ? points : [points]).map((point) => project(point));
-
-		const data: Array<{ sqDist: number; idx: [number, number]; closest: Point }> = [];
-
-		for (let i = -1; i < this.sectionOffsets.length; i++) {
-			const start = i == -1 ? 0 : this.sectionOffsets[i];
-			const end = i < this.sectionOffsets.length - 1 ? this.sectionOffsets[i + 1] : this.trackPoints.length;
-			for (let j = start + 2; j < end; j += 2) {
-				const pointA = { x: this.trackPoints[j - 2], y: this.trackPoints[j - 1] };
-				const pointB = { x: this.trackPoints[j], y: this.trackPoints[j + 1] };
-
-				for (let k = 0; k < projectedPoints.length; k++) {
-					const point = projectedPoints[k];
-					const closest = closestPointOnSegment(point, pointA, pointB);
-					const sqDist = pointDistance(point, closest, true);
-					if (data[k] == null || sqDist < data[k].sqDist) {
-						data[k] = { sqDist, idx: [i, j - 1 + closest.t], closest };
-					}
-				}
-			}
-		}
-
-		const results = data.map((d) => {
-			return {
-				idx: (this.flat ? d.idx[1] : d.idx) as Idx<T>,
-				closest: unproject(d.closest)
-			};
-		});
-
-		return Array.isArray(points) ? results : results[0];
-	}
-}
-
-
-export class JsPolyline3<T extends LatLng[] | LatLng[][]> {
 
 	readonly trackPoints: number[][];
 	readonly flat: boolean;
@@ -353,22 +124,49 @@ export class JsPolyline3<T extends LatLng[] | LatLng[][]> {
 		const closest = { x: 0, y: 0, t: 0 };
 
 		for (let i = 0; i < this.trackPoints.length; i++) {
-			for (let j = 2; j < this.trackPoints[i].length; j += 2) {
-				const x1 = this.trackPoints[i][j - 2];
-				const y1 = this.trackPoints[i][j - 1];
-				const x2 = this.trackPoints[i][j];
-				const y2 = this.trackPoints[i][j + 1];
+			const t = this.trackPoints[i];
 
-				for (let k = 0; k < projectedPoints.length; k++) {
-					const point = projectedPoints[k];
-					closestPointOnSegment2(point, x1, y1, x2, y2, closest);
-					const sqDist = pointDistance(point, closest, true);
-					if (data[k].sqDist === -1 || sqDist < data[k].sqDist) {
-						data[k].sqDist = sqDist;
-						data[k].idx1 = i;
-						data[k].idx2 = j / 2 - 1 + closest.t;
-						data[k].x = closest.x;
-						data[k].y = closest.y;
+			const bboxes = new Array<{ top: number; right: number; bottom: number; left: number; start: number; end: number }>(Math.ceil(t.length / boxSize));
+			for (let b = 0; b < bboxes.length; b++) {
+				bboxes[b] = { top: Infinity, right: -Infinity, bottom: -Infinity, left: Infinity, start: b * boxSize, end: Math.min((b + 1) * boxSize, t.length) };
+				for (let j = bboxes[b].start; j < bboxes[b].end; j += 2) {
+					bboxes[b].top = Math.min(bboxes[0].top, t[j + 1]);
+					bboxes[b].right = Math.max(bboxes[0].right, t[j]);
+					bboxes[b].bottom = Math.max(bboxes[0].bottom, t[j + 1]);
+					bboxes[b].left = Math.min(bboxes[0].left, t[j]);
+				}
+			}
+
+			for (let k = 0; k < projectedPoints.length; k++) {
+				const point = projectedPoints[k];
+				const d = data[k];
+
+				const bboxDist = bboxes.map((b, i) => {
+					const dx = Math.max(b.left - point.x, 0, point.x - b.right);
+					const dy = Math.max(b.top - point.y, 0, point.y - b.bottom);
+					return { start: b.start, end: b.end, sqDist: dx * dx + dy * dy };
+				}).sort((a, b) => a.sqDist - b.sqDist);
+
+				for (const b of bboxDist) {
+					if (d.sqDist !== -1 && b.sqDist > d.sqDist) {
+						break;
+					}
+
+					for (let j = b.start + 2; j < b.end; j += 2) {
+						const x1 = t[j - 2];
+						const y1 = t[j - 1];
+						const x2 = t[j];
+						const y2 = t[j + 1];
+
+						closestPointOnSegment2(point, x1, y1, x2, y2, closest);
+						const sqDist = pointDistance(point, closest, true);
+						if (d.sqDist === -1 || sqDist < d.sqDist) {
+							d.sqDist = sqDist;
+							d.idx1 = i;
+							d.idx2 = j / 2 - 1 + closest.t;
+							d.x = closest.x;
+							d.y = closest.y;
+						}
 					}
 				}
 			}
@@ -385,35 +183,9 @@ export class JsPolyline3<T extends LatLng[] | LatLng[][]> {
 	}
 }
 
+export class JsPolyline2<T extends LatLng[] | LatLng[][]> {
 
-type CustomTreeItem = {
-	a: Point;
-	b: Point;
-	idxA: [number, number];
-}
-
-class CustomTree extends RBush<CustomTreeItem> {
-	override toBBox({ a, b }: CustomTreeItem) {
-		return {
-			minX: Math.min(a.x, b.x),
-			minY: Math.min(a.y, b.y),
-			maxX: Math.max(a.x, b.x),
-			maxY: Math.max(a.y, b.y)
-		};
-	}
-
-    compareMinX({ a: a1, b: b1 }: CustomTreeItem, { a: a2, b: b2 }: CustomTreeItem) {
-		return Math.min(a1.x, b1.x) - Math.min(a2.x, b2.x);
-	}
-
-    compareMinY({ a: a1, b: b1 }: CustomTreeItem, { a: a2, b: b2 }: CustomTreeItem) {
-		return Math.min(a1.y, b1.y) - Math.min(a2.y, b2.y);
-	}
-}
-
-export class KnnPolyline<T extends LatLng[] | LatLng[][]> {
-
-	readonly tree: CustomTree;
+	readonly trackPoints: number[][];
 	readonly flat: boolean;
 
 	constructor(trackPoints: T, isPolygon = false) {
@@ -424,21 +196,13 @@ export class KnnPolyline<T extends LatLng[] | LatLng[][]> {
 			throw new Error("Line doesn't have any track points.");
 		}
 
-		this.tree = new CustomTree();
-		for (let i = 0; i < normalizedTrackPoints.length; i++) {
-			const projectedPoints = [
-				...normalizedTrackPoints[i],
-				...isPolygon && normalizedTrackPoints[i].length > 0 ? [normalizedTrackPoints[i][0]] : []
-			].map((p) => project(p));
-
-			for (let j = 1; j < projectedPoints.length; j++) {
-				this.tree.insert({
-					a: projectedPoints[j - 1],
-					b: projectedPoints[j],
-					idxA: [i, j - 1]
-				});
-			}
-		}
+		this.trackPoints = normalizedTrackPoints.map((t) => [
+			...t,
+			...t.length > 0 && isPolygon ? [t[0]] : []
+		].flatMap((p) => {
+			const { x, y } = project(p);
+			return [x, y];
+		}));
 	}
 
 	/**
@@ -458,51 +222,36 @@ export class KnnPolyline<T extends LatLng[] | LatLng[][]> {
 	locateOnLine(points: LatLng | LatLng[]): { idx: Idx<T>; closest: LatLng } | Array<{ idx: Idx<T>; closest: LatLng }> {
 		const projectedPoints = (Array.isArray(points) ? points : [points]).map((point) => project(point));
 
-		const data = new Array<{ sqDist: number; idx: [number, number]; closest: Point }>(projectedPoints.length);
+		const data = projectedPoints.map(() => ({ sqDist: -1, idx1: 0, idx2: 0, x: 0, y: 0 }));
+		const closest = { x: 0, y: 0, t: 0 };
 
-		for (let i = 0; i < projectedPoints.length; i++) {
-			const point = projectedPoints[i];
+		for (let k = 0; k < projectedPoints.length; k++) {
+			const point = projectedPoints[k];
+			const d = data[k];
+			for (let i = 0; i < this.trackPoints.length; i++) {
+				for (let j = 2; j < this.trackPoints[i].length; j += 2) {
+					const x1 = this.trackPoints[i][j - 2];
+					const y1 = this.trackPoints[i][j - 1];
+					const x2 = this.trackPoints[i][j];
+					const y2 = this.trackPoints[i][j + 1];
 
-			const neighbours = knn(this.tree, point.x, point.y) as CustomTreeItem[];
-
-			for (const { a, b, idxA } of neighbours) {
-				const dx = Math.max(Math.min(a.x, b.x) - point.x, 0, point.x - Math.max(a.x, b.x));
-				const dy = Math.max(Math.min(a.y, b.y) - point.y, 0, point.y - Math.max(a.y, b.y));
-				const sqBoxDist = dx * dx + dy * dy;
-				if (data[i] != null && sqBoxDist > data[i].sqDist) {
-					break;
-				}
-
-				const closest = closestPointOnSegment(point, a, b);
-				const sqDist = pointDistance(point, closest, true);
-				if (data[i] == null || sqDist < data[i].sqDist) {
-					data[i] = { sqDist, idx: [idxA[0], idxA[1] + closest.t], closest };
+					closestPointOnSegment2(point, x1, y1, x2, y2, closest);
+					const sqDist = pointDistance(point, closest, true);
+					if (d.sqDist === -1 || sqDist < d.sqDist) {
+						d.sqDist = sqDist;
+						d.idx1 = i;
+						d.idx2 = j / 2 - 1 + closest.t;
+						d.x = closest.x;
+						d.y = closest.y;
+					}
 				}
 			}
 		}
 
-		// for (let i = -1; i < this.sectionOffsets.length; i++) {
-		// 	const start = i == -1 ? 0 : this.sectionOffsets[i];
-		// 	const end = i < this.sectionOffsets.length - 1 ? this.sectionOffsets[i + 1] : this.trackPoints.length;
-		// 	for (let j = start + 2; j < end; j += 2) {
-		// 		const pointA = { x: this.trackPoints[j - 2], y: this.trackPoints[j - 1] };
-		// 		const pointB = { x: this.trackPoints[j], y: this.trackPoints[j + 1] };
-
-		// 		for (let k = 0; k < projectedPoints.length; k++) {
-		// 			const point = projectedPoints[k];
-		// 			const closest = closestPointOnSegment(point, pointA, pointB);
-		// 			const sqDist = pointDistance(point, closest, true);
-		// 			if (data[k] == null || sqDist < data[k].sqDist) {
-		// 				data[k] = { sqDist, idx: [i, j - 1 + closest.t], closest };
-		// 			}
-		// 		}
-		// 	}
-		// }
-
 		const results = data.map((d) => {
 			return {
-				idx: (this.flat ? d.idx[1] : d.idx) as Idx<T>,
-				closest: unproject(d.closest)
+				idx: (this.flat ? d.idx2 : [d.idx1, d.idx2]) as Idx<T>,
+				closest: unproject(d)
 			};
 		});
 
